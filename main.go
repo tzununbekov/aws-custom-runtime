@@ -27,7 +27,10 @@ import (
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
-	"github.com/triggermesh/aws-custom-runtime/pkg/events/apiGateway"
+	"github.com/triggermesh/aws-custom-runtime/pkg/events"
+	"github.com/triggermesh/aws-custom-runtime/pkg/events/apigateway"
+	"github.com/triggermesh/aws-custom-runtime/pkg/events/cloudevents"
+	"github.com/triggermesh/aws-custom-runtime/pkg/events/passthrough"
 )
 
 type message struct {
@@ -55,15 +58,17 @@ type Specification struct {
 	InternalAPIport string `envconfig:"internal_api_port" default:"80"`
 	// Lambda API port to put function requests and get results
 	ExternalAPIport string `envconfig:"external_api_port" default:"8080"`
-	// Either return function result "as is" or consider it as API Gateway JSON
-	EventType string `envconfig:"event_type"`
+
+	// Apply response wrapping before sending it back to the client.
+	// Common case - AWS Lambda functions usually returns data formatted for API Gateway service.
+	// Set "RESPONSE_WRAPPER: API_GATEWAY" and receive events as if they were processed by API Gateway.
+	// Opposite scenario - return responses in CloudEvent format: "RESPONSE_WRAPPER: CLOUDEVENTS"
+	// NOTE: Response wrapper does both encoding and decoding depending on the type. We should consider
+	// separating wrappers by their function.
+	ResponseWrapper string `envconfig:"response_wrapper"`
 }
 
 var (
-	// numberOfinvokers = 4
-	// requestSizeLimit int64 = 5
-	// functionTTL      int64 = 10
-
 	tasks   chan message
 	results map[string]chan message
 
@@ -227,16 +232,22 @@ func responseHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Specification) mapEvent(h http.Handler) http.Handler {
+	var mapper events.Mapper
+
+	switch s.ResponseWrapper {
+	case "API_GATEWAY":
+		mapper = apigateway.NewMapper()
+	case "CLOUDEVENTS":
+		mapper = cloudevents.NewMapper()
+	default:
+		mapper = passthrough.NewMapper()
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := responseWrapper{w, 200, []byte{}}
-		switch s.EventType {
-		case "API_GATEWAY":
-			apiGateway.Request(r)
-			h.ServeHTTP(&rw, r)
-			apiGateway.Response(w, rw.StatusCode, rw.Body)
-		default:
-			h.ServeHTTP(w, r)
-		}
+		mapper.Request(r)
+		h.ServeHTTP(&rw, r)
+		mapper.Response(w, rw.StatusCode, rw.Body)
 	})
 }
 
@@ -266,22 +277,20 @@ func api() error {
 }
 
 func main() {
-	tasks = make(chan message, 100)
-	results = make(map[string]chan message)
-	defer close(tasks)
-
 	var spec Specification
-
-	err := envconfig.Process("", &spec)
-	if err != nil {
+	if err := envconfig.Process("", &spec); err != nil {
 		log.Fatalf("Cannot process env variables: %v", err)
 	}
 	log.Printf("%+v\n", spec)
 
-	log.Println("Setup app env")
+	log.Println("Setting up runtime env")
 	if err := spec.setupEnv(); err != nil {
 		log.Fatalf("Cannot setup runime env: %v", err)
 	}
+
+	tasks = make(chan message, 100)
+	results = make(map[string]chan message)
+	defer close(tasks)
 
 	log.Println("Starting API")
 	go func() {
@@ -307,7 +316,7 @@ func main() {
 	taskHandler := http.HandlerFunc(spec.newTask)
 	taskRouter.Handle("/", spec.mapEvent(taskHandler))
 	log.Println("Listening...")
-	err = http.ListenAndServe(":"+spec.ExternalAPIport, taskRouter)
+	err := http.ListenAndServe(":"+spec.ExternalAPIport, taskRouter)
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Runtime external API error: %v", err)
 	}
